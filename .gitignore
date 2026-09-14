@@ -1,0 +1,10 @@
+build/
+romfs/shaders/
+romfs/cacert.pem
+.ai/
+*.nro
+*.nacp
+*.elf
+*.map
+external/
+romfs/build.txt
