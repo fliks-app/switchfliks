@@ -2,8 +2,20 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace player {
+
+// One `#EXT-X-MEDIA:TYPE=AUDIO` rendition from a master playlist. The server
+// splits audio out of the variant whenever a source carries more than one
+// track, so on those titles this list is the only place audio exists at all.
+struct HlsAudioRendition {
+    std::string url;   // absolute, already joined against the master
+    std::string name;
+    std::string language;
+    int channels = 0;
+    bool isDefault = false;
+};
 
 // ffmpeg's HLS demuxer picks a variant by itself and takes the first one in
 // the master playlist, which is the highest rung the server published. On
@@ -19,7 +31,12 @@ namespace player {
 // at 4.13, and picking on height alone always takes the expensive one — which
 // is wrong on exactly the links where the choice matters. 0 means no
 // preference, i.e. the tallest, richest rung that fits the height cap.
+//
+// `audioOut`, when given, receives the renditions in the chosen variant's
+// `AUDIO` group, in playlist order. Empty means the variant carries its own
+// audio muxed in, which is what the server does for single-track sources.
 bool selectHlsVariant(const std::string& masterUrl, const std::string& masterBody, int maxHeight,
-                      int64_t maxBandwidth, std::string& variantUrl, int& chosenHeight);
+                      int64_t maxBandwidth, std::string& variantUrl, int& chosenHeight,
+                      std::vector<HlsAudioRendition>* audioOut = nullptr);
 
 } // namespace player

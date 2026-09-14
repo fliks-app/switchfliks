@@ -31,13 +31,20 @@ namespace player {
 // segment", which the player does by rebuilding the feed.
 class HlsFeed {
 public:
+    // Roughly six video fragments of lookahead, which is far more than a
+    // segment fetch takes even on a slow link.
+    static constexpr size_t kMaxBuffered = 8 * 1024 * 1024;
+
     struct Segment {
         std::string url;
         double duration = 0;
         double start = 0;
     };
 
-    HlsFeed();
+    // `ringBytes` sizes the read-ahead. The default suits video; an audio
+    // rendition wants far less, or its producer races minutes ahead and takes
+    // the link away from the video feed exactly when the picture needs it.
+    explicit HlsFeed(size_t ringBytes = kMaxBuffered);
     ~HlsFeed();
     HlsFeed(const HlsFeed&) = delete;
     HlsFeed& operator=(const HlsFeed&) = delete;
@@ -76,10 +83,8 @@ private:
     double m_startTime = 0;
     bool m_initPending = false;
 
-    // Roughly six fragments of lookahead, which is far more than a segment
-    // fetch takes even on a slow link.
-    static constexpr size_t kMaxBuffered = 8 * 1024 * 1024;
     static constexpr size_t kChunkSize = 64 * 1024;
+    size_t m_ringBytes = kMaxBuffered;
 
     util::Thread m_thread;
     mutable std::mutex m_mutex;

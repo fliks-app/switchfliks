@@ -2,9 +2,12 @@ build/
 romfs/shaders/
 romfs/cacert.pem
 .ai/
+.idea/
 *.nro
 *.nacp
 *.elf
 *.map
 external/
 romfs/build.txt
+config.txt
+log.txt

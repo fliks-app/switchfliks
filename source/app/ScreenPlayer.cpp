@@ -951,6 +951,10 @@ private:
                 // The server lists its whole ladder in the master playlist and
                 // ffmpeg would take the top rung, so the variant is chosen here
                 // and ffmpeg is handed that playlist instead of the master.
+                // The master is also the only place the audio renditions are
+                // named: for a source with more than one track the server
+                // moves audio out of the variant entirely.
+                std::vector<player::HlsAudioRendition> audioRenditions;
                 if (ok && info.playUrl.find(".m3u8") != std::string::npos) {
                     net::Request master;
                     master.url = info.playUrl;
@@ -959,13 +963,13 @@ private:
                     int height = 0;
                     if (body.ok() &&
                         player::selectHlsVariant(info.playUrl, body.body, maxHeight, maxBandwidth,
-                                                 variantUrl, height)) {
+                                                 variantUrl, height, &audioRenditions)) {
                         info.playUrl = variantUrl;
                         if (height > 0) info.height = height;
                     }
                 }
 
-                tasks->postToMain([this, live, ok, info, error, startAt] {
+                tasks->postToMain([this, live, ok, info, error, startAt, audioRenditions] {
                     if (!live->alive) return;
                     if (!ok) {
                         FLIKS_LOG("player: playback-info failed: %s", error.c_str());
@@ -984,7 +988,7 @@ private:
                     // `startAt` only tells the backend where to pre-spawn
                     // ffmpeg; the manifest still covers the whole file, so
                     // the seek to the resume point happens here either way.
-                    m_player.open(info.playUrl, startAt);
+                    m_player.open(info.playUrl, startAt, audioRenditions);
                 });
             },
             util::TaskQueue::Priority::High);

@@ -173,10 +173,10 @@ std::vector<AudioTrack> Player::audioTracks() const
     return m_audioTracks;
 }
 
-void Player::selectAudioTrack(int streamIndex)
+void Player::selectAudioTrack(int selector)
 {
-    if (streamIndex == m_audioTrack.load()) return;
-    m_audioTrackRequest = streamIndex;
+    if (selector == m_audioTrack.load()) return;
+    m_audioTrackRequest = selector;
     m_cv.notify_all();
 }
 
@@ -238,6 +238,15 @@ struct Player::Impl {
     HwState hw;
     HlsFeed feed;
     bool usingFeed = false;
+    // Set only when the master split audio into `#EXT-X-MEDIA` renditions: a
+    // second playlist, walked by its own feed, demuxed by its own context and
+    // read alongside the video one. `audioStream` then indexes *this* context.
+    AVFormatContext* audioFmt = nullptr;
+    // A minute of stereo AAC — the rendition is a fraction of the video's
+    // bitrate, and a ring sized for video would have it minutes ahead.
+    HlsFeed audioFeed{ 1024 * 1024 };
+    // Ordinal of the rendition in play, -1 when audio is muxed into the video.
+    int audioRendition = -1;
     int64_t streamBitrate = 0;
     AVCodecContext* video = nullptr;
     AVCodecContext* audio = nullptr;
@@ -336,7 +345,8 @@ double Player::bufferedSeconds() const
     return static_cast<double>(m_frames.size()) / 24.0;
 }
 
-bool Player::open(const std::string& url, double startAtSeconds)
+bool Player::open(const std::string& url, double startAtSeconds,
+                  const std::vector<HlsAudioRendition>& audioRenditions)
 {
     close();
 
@@ -368,6 +378,10 @@ bool Player::open(const std::string& url, double startAtSeconds)
     }
 
     m_openUrl = url;
+    m_audioRenditions = audioRenditions;
+    if (!m_audioRenditions.empty())
+        FLIKS_LOG("player: %zu audio renditions alongside the variant",
+                  m_audioRenditions.size());
     m_running = true;
     if (!m_thread.start([this] { demuxLoop(); }, util::Thread::kDemuxStack)) {
         m_running = false;
@@ -500,6 +514,14 @@ void Player::runSession(double startAt)
         if (impl.audio) avcodec_free_context(&impl.audio);
         if (impl.hwDevice) av_buffer_unref(&impl.hwDevice);
         impl.hw.pixFmt = AV_PIX_FMT_NONE;
+        if (impl.audioFmt) {
+            AVIOContext* apb = impl.audioFmt->pb;
+            avformat_close_input(&impl.audioFmt);
+            detachFeedIo(apb);
+        }
+        impl.audioFeed.close();
+        impl.audioFmt = nullptr;
+        impl.audioRendition = -1;
         if (impl.fmt) {
             AVIOContext* pb = impl.fmt->pb;
             avformat_close_input(&impl.fmt);
@@ -624,8 +646,8 @@ void Player::runSession(double startAt)
         }
     }
 
-    auto openDecoder = [&](int index, AVCodecContext** out) -> bool {
-        AVStream* stream = impl.fmt->streams[index];
+    auto openDecoder = [&](AVFormatContext* ctx, int index, AVCodecContext** out) -> bool {
+        AVStream* stream = ctx->streams[index];
         const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
         if (!codec) return false;
         *out = avcodec_alloc_context3(codec);
@@ -638,7 +660,7 @@ void Player::runSession(double startAt)
         // ffmpeg is built with --enable-nvtegra. Looked up by name rather
         // than by enum so a toolchain without it still compiles and simply
         // decodes in software.
-        if (index == impl.videoStream && util::configInt("hwdec", 1) != 0) {
+        if (ctx == impl.fmt && index == impl.videoStream && util::configInt("hwdec", 1) != 0) {
             const AVHWDeviceType type = av_hwdevice_find_type_by_name("nvtegra");
             if (type != AV_HWDEVICE_TYPE_NONE &&
                 av_hwdevice_ctx_create(&impl.hwDevice, type, nullptr, nullptr, 0) >= 0) {
@@ -667,7 +689,7 @@ void Player::runSession(double startAt)
         return true;
     };
 
-    if (!openDecoder(impl.videoStream, &impl.video)) {
+    if (!openDecoder(impl.fmt, impl.videoStream, &impl.video)) {
         fail("no decoder for this video");
         teardown();
         return;
@@ -679,37 +701,139 @@ void Player::runSession(double startAt)
               avcodec_get_name(impl.video->codec_id), impl.video->width, impl.video->height,
               static_cast<int>(impl.video->pix_fmt), impl.audioStream);
 
-    {
-        // Every audio stream the container carries, in its own order, so a
-        // switch can name one by ffmpeg's index rather than a position that
-        // shifts when the session is rebuilt.
-        std::vector<AudioTrack> tracks;
-        for (unsigned i = 0; i < impl.fmt->nb_streams; i++) {
-            const AVStream* st = impl.fmt->streams[i];
-            if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
-            AudioTrack track;
-            track.index = static_cast<int>(i);
-            if (const AVDictionaryEntry* e = av_dict_get(st->metadata, "language", nullptr, 0))
-                track.language = e->value;
-            if (const AVDictionaryEntry* e = av_dict_get(st->metadata, "title", nullptr, 0))
-                track.title = e->value;
-            if (const char* name = avcodec_get_name(st->codecpar->codec_id)) track.codec = name;
-            track.channels = st->codecpar->ch_layout.nb_channels;
-            tracks.push_back(std::move(track));
+    // The server hands audio over as separate `#EXT-X-MEDIA` renditions for
+    // every source with more than one track — the variant then carries video
+    // and nothing else, so the only audio there is lives behind one of those
+    // URIs. A second feed walks the chosen one and a second context demuxes
+    // it; both are cut on the same segment grid and carry source timestamps,
+    // so the two sides share one timeline without any correction here.
+    const std::vector<HlsAudioRendition>& renditions = m_audioRenditions;
+    auto openAudioRendition = [&](int ordinal) -> bool {
+        const HlsAudioRendition& r = renditions[static_cast<size_t>(ordinal)];
+        net::Request req;
+        req.url = r.url;
+        const net::Response body = net::perform(req);
+        if (!body.ok() || !impl.audioFeed.parse(r.url, body.body)) {
+            FLIKS_LOG("player: could not read the audio rendition playlist");
+            return false;
         }
-        // A track chosen before this session started — a switch reopens the
-        // whole thing on a fed stream — is honoured if it is still there.
-        const int wanted = m_audioTrack.load();
-        if (wanted >= 0) {
-            for (const AudioTrack& track : tracks)
-                if (track.index == wanted) impl.audioStream = wanted;
+        if (!impl.audioFeed.open(startAt)) {
+            FLIKS_LOG("player: could not fetch the first audio segment");
+            return false;
+        }
+        impl.audioFmt = avformat_alloc_context();
+        if (!impl.audioFmt || !attachFeedIo(impl.audioFmt, &impl.audioFeed)) {
+            if (impl.audioFmt) avformat_free_context(impl.audioFmt);
+            impl.audioFmt = nullptr;
+            return false;
+        }
+        impl.audioFmt->interrupt_callback.callback = &Player::interruptCb;
+        impl.audioFmt->interrupt_callback.opaque = this;
+        AVIOContext* ownedAudioIo = impl.audioFmt->pb;
+        if (avformat_open_input(&impl.audioFmt, r.url.c_str(), nullptr, nullptr) != 0) {
+            // open_input frees the context on failure but never the custom IO.
+            impl.audioFmt = nullptr;
+            detachFeedIo(ownedAudioIo);
+            FLIKS_LOG("player: the audio rendition would not open");
+            return false;
+        }
+        if (avformat_find_stream_info(impl.audioFmt, nullptr) < 0) return false;
+        const int stream =
+            av_find_best_stream(impl.audioFmt, AVMEDIA_TYPE_AUDIO, -1, -1, nullptr, 0);
+        if (stream < 0) {
+            FLIKS_LOG("player: the audio rendition carries no audio stream");
+            return false;
+        }
+        impl.audioStream = stream;
+        impl.audioRendition = ordinal;
+        FLIKS_LOG("player: audio rendition %d ('%s') open, stream %d", ordinal, r.name.c_str(),
+                  stream);
+        return true;
+    };
+
+    if (!renditions.empty()) {
+        // The rendition carried across a restart — a switch on a fed stream is
+        // a restart — else the one the master marked DEFAULT.
+        int wanted = m_audioTrack.load();
+        if (wanted < 0 || wanted >= static_cast<int>(renditions.size())) {
+            wanted = 0;
+            for (size_t i = 0; i < renditions.size(); i++)
+                if (renditions[i].isDefault) {
+                    wanted = static_cast<int>(i);
+                    break;
+                }
+        }
+        if (!openAudioRendition(wanted)) {
+            // Leave the picture playing rather than failing the title: the
+            // wall clock already carries a stream with no audio.
+            if (impl.audioFmt) {
+                AVIOContext* apb = impl.audioFmt->pb;
+                avformat_close_input(&impl.audioFmt);
+                detachFeedIo(apb);
+            }
+            impl.audioFmt = nullptr;
+            impl.audioFeed.close();
+            impl.audioStream = -1;
+            impl.audioRendition = -1;
+        }
+    }
+
+    {
+        // One entry per selectable track, in playlist or container order, so a
+        // switch names one by something that survives a session rebuild: the
+        // rendition ordinal on a split stream, ffmpeg's stream index on a
+        // muxed one.
+        std::vector<AudioTrack> tracks;
+        if (!renditions.empty()) {
+            for (size_t i = 0; i < renditions.size(); i++) {
+                AudioTrack track;
+                track.index = static_cast<int>(i);
+                track.language = renditions[i].language;
+                track.title = renditions[i].name;
+                track.channels = renditions[i].channels;
+                // Only the rendition that is open has been probed; the rest
+                // are named by the master, which does not publish a codec.
+                if (static_cast<int>(i) == impl.audioRendition && impl.audioStream >= 0)
+                    if (const char* name = avcodec_get_name(
+                            impl.audioFmt->streams[impl.audioStream]->codecpar->codec_id))
+                        track.codec = name;
+                tracks.push_back(std::move(track));
+            }
+        } else {
+            for (unsigned i = 0; i < impl.fmt->nb_streams; i++) {
+                const AVStream* st = impl.fmt->streams[i];
+                if (st->codecpar->codec_type != AVMEDIA_TYPE_AUDIO) continue;
+                AudioTrack track;
+                track.index = static_cast<int>(i);
+                if (const AVDictionaryEntry* e = av_dict_get(st->metadata, "language", nullptr, 0))
+                    track.language = e->value;
+                if (const AVDictionaryEntry* e = av_dict_get(st->metadata, "title", nullptr, 0))
+                    track.title = e->value;
+                if (const char* name = avcodec_get_name(st->codecpar->codec_id)) track.codec = name;
+                track.channels = st->codecpar->ch_layout.nb_channels;
+                tracks.push_back(std::move(track));
+            }
+            // A track chosen before this session started — a switch reopens the
+            // whole thing on a fed stream — is honoured if it is still there.
+            const int wanted = m_audioTrack.load();
+            if (wanted >= 0) {
+                for (const AudioTrack& track : tracks)
+                    if (track.index == wanted) impl.audioStream = wanted;
+            }
         }
         std::lock_guard<std::mutex> lock(m_mutex);
         m_audioTracks = std::move(tracks);
     }
-    m_audioTrack = impl.audioStream;
+    // What `selectAudioTrack` will be compared against, in the same space as
+    // the track indices published above.
+    int audioSelector = renditions.empty() ? impl.audioStream : impl.audioRendition;
+    m_audioTrack = audioSelector;
     for (const AudioTrack& track : audioTracks())
         FLIKS_LOG("player: audio track %d: %s", track.index, track.label().c_str());
+
+    // Whichever context owns the audio stream: the rendition's when the server
+    // split it out, the video's when it is muxed in.
+    auto audioCtx = [&] { return impl.audioFmt ? impl.audioFmt : impl.fmt; };
 
     // audout is fixed at 48kHz stereo s16, so every track resamples to that
     // whatever it carries.
@@ -727,8 +851,8 @@ void Player::runSession(double startAt)
         }
     };
 
-    if (impl.audioStream >= 0 && openDecoder(impl.audioStream, &impl.audio)) {
-        impl.audioTimeBase = av_q2d(impl.fmt->streams[impl.audioStream]->time_base);
+    if (impl.audioStream >= 0 && openDecoder(audioCtx(), impl.audioStream, &impl.audio)) {
+        impl.audioTimeBase = av_q2d(audioCtx()->streams[impl.audioStream]->time_base);
         buildResampler();
     }
     // Only trust the audio clock if there is really audio behind it.
@@ -743,7 +867,11 @@ void Player::runSession(double startAt)
     m_state = State::Playing;
 
     AVPacket* packet = av_packet_alloc();
+    // The audio context is read on this same thread but on its own cadence,
+    // so it needs a packet of its own rather than sharing the video one.
+    AVPacket* apacket = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
+    bool audioEof = false;
     // The decode thread owns this one; `frame` stays with audio on this thread.
     AVFrame* vframe = av_frame_alloc();
     bool eof = false;
@@ -869,6 +997,42 @@ void Player::runSession(double startAt)
         decodeTicks.fetch_add(armGetSystemTick() - decodeStart);
     };
 
+    // `pkt` may be null, which flushes the decoder at end of stream.
+    auto decodeAudio = [&](AVPacket* pkt) {
+        if (!impl.audio) return;
+        if (pkt && audioPacketsSeen < 3) {
+            audioPacketsSeen++;
+            FLIKS_LOG("audio pkt %d after %d video packets, size=%d pts=%lld", audioPacketsSeen,
+                      packetsSeen, pkt->size, static_cast<long long>(pkt->pts));
+        }
+        if (avcodec_send_packet(impl.audio, pkt) < 0) return;
+        while (avcodec_receive_frame(impl.audio, frame) >= 0) {
+            if (!impl.swr) {
+                av_frame_unref(frame);
+                continue;
+            }
+            const int maxOut = swr_get_out_samples(impl.swr, frame->nb_samples);
+            if (maxOut <= 0) {
+                av_frame_unref(frame);
+                continue;
+            }
+            impl.audioBuffer.resize(static_cast<size_t>(maxOut) * AudioOut::kChannels * 2);
+            uint8_t* dst = impl.audioBuffer.data();
+            const int converted = swr_convert(impl.swr, &dst, maxOut,
+                                              const_cast<const uint8_t**>(frame->data),
+                                              frame->nb_samples);
+            if (converted > 0) {
+                if (audioWritesSeen < 3) {
+                    audioWritesSeen++;
+                    FLIKS_LOG("audio: writing %d samples to audout", converted);
+                }
+                impl.out.write(impl.audioBuffer.data(),
+                               static_cast<size_t>(converted) * AudioOut::kChannels * 2);
+            }
+            av_frame_unref(frame);
+        }
+    };
+
     auto pumpLoop = [&] {
         for (;;) {
             AVPacket* pkt = nullptr;
@@ -937,6 +1101,7 @@ void Player::runSession(double startAt)
         m_state = State::Failed;
         av_frame_free(&vframe);
         av_frame_free(&frame);
+        av_packet_free(&apacket);
         av_packet_free(&packet);
         teardown();
         return;
@@ -955,13 +1120,16 @@ void Player::runSession(double startAt)
         // with packets in flight — so it is handled here, at the top of a
         // pass, and then re-anchored by seeking to where playback already is.
         const int wantAudio = m_audioTrackRequest.exchange(-1);
-        if (wantAudio >= 0 && wantAudio != impl.audioStream) {
+        if (wantAudio >= 0 && wantAudio != audioSelector) {
             const double at = position();
-            FLIKS_LOG("player: audio track %d -> %d at %.1fs", impl.audioStream, wantAudio, at);
+            FLIKS_LOG("player: audio track %d -> %d at %.1fs", audioSelector, wantAudio, at);
             m_audioTrack = wantAudio;
+            audioSelector = wantAudio;
             if (impl.usingFeed) {
                 // A fed stream has no index to seek, so the session is rebuilt
                 // — and reopening reads the track back out of m_audioTrack.
+                // A split-out rendition takes this path too: the switch is a
+                // different playlist, not a different stream in this one.
                 m_restartAt = at;
                 m_restartPending = true;
                 m_cv.notify_all();
@@ -969,8 +1137,8 @@ void Player::runSession(double startAt)
             }
             if (impl.audio) avcodec_free_context(&impl.audio);
             impl.audioStream = wantAudio;
-            if (openDecoder(impl.audioStream, &impl.audio)) {
-                impl.audioTimeBase = av_q2d(impl.fmt->streams[impl.audioStream]->time_base);
+            if (openDecoder(audioCtx(), impl.audioStream, &impl.audio)) {
+                impl.audioTimeBase = av_q2d(audioCtx()->streams[impl.audioStream]->time_base);
                 buildResampler();
             } else {
                 FLIKS_LOG("player: could not open audio track %d", wantAudio);
@@ -1091,17 +1259,43 @@ void Player::runSession(double startAt)
             continue;
         }
 
+        // Split-out rendition: audio has its own context and its own feed, and
+        // nothing in the video packets can ever satisfy the device — so it is
+        // pumped first, and whenever the device has room, whatever the video
+        // side is doing.
+        if (impl.audioFmt) {
+            if (!audioEof && !audioFull) {
+                const int arc = av_read_frame(impl.audioFmt, apacket);
+                if (arc < 0) {
+                    decodeAudio(nullptr);   // flush
+                    audioEof = true;
+                    FLIKS_LOG("player: audio rendition ended");
+                } else {
+                    if (apacket->stream_index == impl.audioStream) decodeAudio(apacket);
+                    av_packet_unref(apacket);
+                }
+            }
+            // The video side holds all it can, so this pass is done.
+            if (packetsFull && !eof) continue;
+        }
+
         if (eof) {
             bool drained;
             {
                 std::lock_guard<std::mutex> lock(pump.mutex);
                 drained = pump.drained;
             }
-            if (drained && queuedFrames() == 0 && impl.out.queuedBytes() == 0) {
+            // A split-out rendition has its own playlist to finish; the video
+            // one running out says nothing about it.
+            if (drained && queuedFrames() == 0 && impl.out.queuedBytes() == 0 &&
+                (!impl.audioFmt || audioEof)) {
                 if (!m_restartPending.load()) m_state = State::Ended;
                 break;
             }
-            svcSleepThread(20'000'000ULL);
+            // A split-out rendition is still feeding the device from its own
+            // playlist; a full 20 ms a pass would throttle it to barely real
+            // time, and the device would run dry over the tail of the film.
+            svcSleepThread(impl.audioFmt && !audioEof ? 2'000'000ULL : 20'000'000ULL);
             continue;
         }
 
@@ -1119,7 +1313,7 @@ void Player::runSession(double startAt)
                 pump.drain = true;
                 pump.cv.notify_all();
             }
-            if (impl.audio) avcodec_send_packet(impl.audio, nullptr);
+            if (!impl.audioFmt && impl.audio) avcodec_send_packet(impl.audio, nullptr);
             eof = true;
             continue;
         }
@@ -1138,40 +1332,10 @@ void Player::runSession(double startAt)
             continue;
         }
 
-        if (packet->stream_index == impl.audioStream && audioPacketsSeen < 3) {
-            audioPacketsSeen++;
-            FLIKS_LOG("audio pkt %d after %d video packets, size=%d pts=%lld", audioPacketsSeen,
-                      packetsSeen, packet->size, static_cast<long long>(packet->pts));
-        }
-
-        if (packet->stream_index == impl.audioStream && impl.audio &&
-            avcodec_send_packet(impl.audio, packet) >= 0) {
-            while (avcodec_receive_frame(impl.audio, frame) >= 0) {
-                if (!impl.swr) {
-                    av_frame_unref(frame);
-                    continue;
-                }
-                const int maxOut = swr_get_out_samples(impl.swr, frame->nb_samples);
-                if (maxOut <= 0) {
-                    av_frame_unref(frame);
-                    continue;
-                }
-                impl.audioBuffer.resize(static_cast<size_t>(maxOut) * AudioOut::kChannels * 2);
-                uint8_t* dst = impl.audioBuffer.data();
-                const int converted =
-                    swr_convert(impl.swr, &dst, maxOut,
-                                const_cast<const uint8_t**>(frame->data), frame->nb_samples);
-                if (converted > 0) {
-                    if (audioWritesSeen < 3) {
-                        audioWritesSeen++;
-                        FLIKS_LOG("audio: writing %d samples to audout", converted);
-                    }
-                    impl.out.write(impl.audioBuffer.data(),
-                                   static_cast<size_t>(converted) * AudioOut::kChannels * 2);
-                }
-                av_frame_unref(frame);
-            }
-        }
+        // Only when audio is muxed into this container: a split-out rendition
+        // is pumped from its own context above, and its stream index would
+        // otherwise collide with a video-only container's single stream.
+        if (!impl.audioFmt && packet->stream_index == impl.audioStream) decodeAudio(packet);
         av_packet_unref(packet);
     }
 
@@ -1182,6 +1346,7 @@ void Player::runSession(double startAt)
     releasePending();
     av_frame_free(&vframe);
     av_frame_free(&frame);
+    av_packet_free(&apacket);
     av_packet_free(&packet);
     teardown();
 }

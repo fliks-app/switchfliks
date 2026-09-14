@@ -14,6 +14,14 @@ struct Variant {
     int height = 0;
     long long bandwidth = 0;
     std::string uri;
+    std::string audioGroup;
+};
+
+// A raw `#EXT-X-MEDIA` line, kept in playlist order until the variant — and
+// with it the group that matters — has been chosen.
+struct Rendition {
+    std::string group;
+    HlsAudioRendition media;
 };
 
 std::string trimmed(const std::string& s)
@@ -47,6 +55,30 @@ long long bandwidthOf(const std::string& line)
     return std::atoll(line.c_str() + at + 10);
 }
 
+// ATTR=value or ATTR="value", from an EXT-X tag's comma-separated list.
+// Anchored on the preceding comma or colon so GROUP-ID never matches inside
+// AUDIO-GROUP-ID and NAME never matches inside GROUP-ID.
+std::string attribute(const std::string& line, const char* name)
+{
+    const std::string key = std::string(name) + "=";
+    size_t at = line.find(key);
+    while (at != std::string::npos) {
+        const char before = at > 0 ? line[at - 1] : ':';
+        if (before == ',' || before == ':') break;
+        at = line.find(key, at + 1);
+    }
+    if (at == std::string::npos) return {};
+
+    size_t start = at + key.size();
+    if (start < line.size() && line[start] == '"') {
+        const size_t end = line.find('"', start + 1);
+        if (end == std::string::npos) return {};
+        return line.substr(start + 1, end - start - 1);
+    }
+    const size_t end = line.find(',', start);
+    return line.substr(start, end == std::string::npos ? std::string::npos : end - start);
+}
+
 // How far apart two bitrates are in scale rather than in absolute terms:
 // 1.0 is identical, 2.0 is double or half. Symmetrical, so neither side of
 // the comparison is privileged.
@@ -61,9 +93,39 @@ double bitrateDistance(int64_t bandwidth, int64_t wanted)
 } // namespace
 
 bool selectHlsVariant(const std::string& masterUrl, const std::string& masterBody, int maxHeight,
-                      int64_t maxBandwidth, std::string& variantUrl, int& chosenHeight)
+                      int64_t maxBandwidth, std::string& variantUrl, int& chosenHeight,
+                      std::vector<HlsAudioRendition>* audioOut)
 {
+    if (audioOut) audioOut->clear();
     if (masterBody.find("#EXT-X-STREAM-INF") == std::string::npos) return false;
+
+    // The server splits audio into its own renditions for every source with
+    // more than one track, and the variant then carries no audio at all — so
+    // these are not decoration, they are the stream. Collected in a pass of
+    // their own because the variant pass below consumes the lines after a
+    // STREAM-INF while it hunts for that variant's URI.
+    std::vector<Rendition> renditions;
+    if (audioOut) {
+        size_t at = 0;
+        while (at < masterBody.size()) {
+            size_t eol = masterBody.find('\n', at);
+            if (eol == std::string::npos) eol = masterBody.size();
+            const std::string line = trimmed(masterBody.substr(at, eol - at));
+            at = eol + 1;
+            if (line.rfind("#EXT-X-MEDIA:", 0) != 0) continue;
+            if (attribute(line, "TYPE") != "AUDIO") continue;
+            const std::string uri = attribute(line, "URI");
+            if (uri.empty()) continue;
+            Rendition r;
+            r.group = attribute(line, "GROUP-ID");
+            r.media.url = net::joinUrl(masterUrl, uri);
+            r.media.name = attribute(line, "NAME");
+            r.media.language = attribute(line, "LANGUAGE");
+            r.media.channels = std::atoi(attribute(line, "CHANNELS").c_str());
+            r.media.isDefault = attribute(line, "DEFAULT") == "YES";
+            renditions.push_back(std::move(r));
+        }
+    }
 
     std::vector<Variant> variants;
     size_t pos = 0;
@@ -82,7 +144,8 @@ bool selectHlsVariant(const std::string& masterUrl, const std::string& masterBod
             const std::string uri = trimmed(masterBody.substr(pos, uriEol - pos));
             pos = uriEol + 1;
             if (uri.empty() || uri[0] == '#') continue;
-            variants.push_back(Variant{ heightOf(line), bandwidthOf(line), uri });
+            variants.push_back(
+                Variant{ heightOf(line), bandwidthOf(line), uri, attribute(line, "AUDIO") });
             break;
         }
     }
@@ -132,6 +195,21 @@ bool selectHlsVariant(const std::string& masterUrl, const std::string& masterBod
     FLIKS_LOG("hls: %zu variants, picked %dp at %.2f Mbit/s (cap %dp, %.2f Mbit/s)",
               variants.size(), best->height, best->bandwidth / 1.0e6, maxHeight,
               maxBandwidth / 1.0e6);
+
+    // Only the group this variant names: a master can publish several, and a
+    // rendition from another group is not in sync with these segments.
+    if (audioOut && !best->audioGroup.empty()) {
+        for (const Rendition& r : renditions) {
+            if (r.group != best->audioGroup) continue;
+            audioOut->push_back(r.media);
+            FLIKS_LOG("hls: audio rendition '%s' (%s, %dch)%s", r.media.name.c_str(),
+                      r.media.language.c_str(), r.media.channels,
+                      r.media.isDefault ? " default" : "");
+        }
+        if (audioOut->empty())
+            FLIKS_LOG("hls: variant names audio group '%s' but the master lists none",
+                      best->audioGroup.c_str());
+    }
     return true;
 }
 

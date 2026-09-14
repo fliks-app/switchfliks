@@ -41,7 +41,10 @@ struct HlsFeed::Impl {
     bool open = false;
 };
 
-HlsFeed::HlsFeed() : m_impl(new Impl) {}
+HlsFeed::HlsFeed(size_t ringBytes)
+    : m_impl(new Impl), m_ringBytes(std::max<size_t>(ringBytes, kChunkSize * 4))
+{
+}
 HlsFeed::~HlsFeed() { close(); }
 
 bool HlsFeed::parse(const std::string& playlistUrl, const std::string& body)
@@ -116,7 +119,7 @@ bool HlsFeed::open(double seconds)
     m_initPending = !m_initUrl.empty();
     m_finished = false;
     m_failed = false;
-    m_ring.assign(kMaxBuffered, 0);
+    m_ring.assign(m_ringBytes, 0);
     m_head = m_tail = m_buffered = 0;
 
     FLIKS_LOG("hls: feed starting at segment %zu (t=%.1f)", index, m_startTime);

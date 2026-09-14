@@ -219,11 +219,19 @@ an older build still loads.
 and Right step between them, skipping any that is empty. Three near-identical
 menus would have been three places to fix the next layout problem.
 
-Audio tracks come from the container, not the server: ffmpeg already
-enumerated every stream, and switching is a decoder swap the demuxer performs
-at a packet boundary, then a seek to the current position to re-anchor the
-clock. On a fed stream there is no index to seek, so the session is rebuilt
-instead — the same path a rung change takes.
+Audio tracks come from the container when the server muxed them in: ffmpeg
+already enumerated every stream, and switching is a decoder swap the demuxer
+performs at a packet boundary, then a seek to the current position to
+re-anchor the clock. On a fed stream there is no index to seek, so the session
+is rebuilt instead — the same path a rung change takes.
+
+For a source with **more than one audio track** the server does not mux at
+all. `pickAudioLayout` switches to ffmpeg's `var_stream_map`: the variant
+playlist carries video only and each track becomes an `#EXT-X-MEDIA` rendition
+with its own playlist, its own init segment and its own segments. So the
+master is parsed for those renditions too, and the chosen one gets a second
+`HlsFeed` and a second `AVFormatContext`, read on the demux thread alongside
+the video one.
 
 Subtitles are WebVTT, fetched whole from the server, which renders embedded
 streams, downloaded files and OCR output to that one format. A film's cues are

@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "player/HlsVariant.h"
 #include "util/Thread.h"
 
 struct AVFrame;
@@ -39,9 +40,11 @@ void loadSettings();
 
 enum class State { Idle, Opening, Playing, Paused, Buffering, Ended, Failed };
 
-// One selectable audio stream inside the container. The index is ffmpeg's
-// stream index, which is what the demuxer needs and what survives a session
-// restart — a fed stream rebuilds its format context on every seek.
+// One selectable audio stream. `index` is ffmpeg's stream index when the
+// container carries the audio muxed in, and the ordinal of the `#EXT-X-MEDIA`
+// rendition when the server split audio into its own playlists — either way
+// it is the selector `selectAudioTrack` takes, and it survives a session
+// restart, which a fed stream performs on every seek and every switch.
 struct AudioTrack {
     int index = 0;
     std::string language;
@@ -59,7 +62,12 @@ public:
     Player();
     ~Player();
 
-    bool open(const std::string& url, double startAtSeconds);
+    // `audioRenditions` carries the master playlist's `#EXT-X-MEDIA:TYPE=AUDIO`
+    // entries, if any. The server publishes those — and strips audio out of
+    // the variant entirely — for every source with more than one track, so on
+    // those titles this is the only audio there is.
+    bool open(const std::string& url, double startAtSeconds,
+              const std::vector<HlsAudioRendition>& audioRenditions = {});
     void close();
 
     void setPaused(bool paused);
@@ -90,7 +98,7 @@ public:
     // Applied by the demux thread at a packet boundary: switching means
     // tearing down one decoder and building another, which cannot happen
     // underneath a decode in flight.
-    void selectAudioTrack(int streamIndex);
+    void selectAudioTrack(int selector);
 
     int droppedFrames() const { return m_dropped.load(); }
     int queuedFrames() const;
@@ -133,6 +141,8 @@ private:
     std::atomic<int> m_audioTrack{ -1 };
     std::atomic<int> m_audioTrackRequest{ -1 };
     std::vector<AudioTrack> m_audioTracks;
+    // Written before the demux thread starts, read by it — like m_openUrl.
+    std::vector<HlsAudioRendition> m_audioRenditions;
     // Resume offset, applied as a normal seek once frames are flowing
     // rather than against a stream that has never produced one.
     std::atomic<double> m_pendingStartSeek{ -1.0 };
